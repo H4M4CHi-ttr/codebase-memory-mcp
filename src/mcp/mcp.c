@@ -8,6 +8,7 @@
 // operations
 
 #include "foundation/constants.h"
+#include "semantic/embedding_backend.h"
 
 enum {
     MCP_FIELD_SIZE = 1040,
@@ -572,6 +573,9 @@ static const tool_def_t TOOLS[] = {
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
      "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Not with query.\"},"
+     "\"embedding_model\":{\"type\":\"string\",\"enum\":[\"default\",\"embeddinggemma-2\"],"
+     "\"description\":\"Optional local backend for semantic_query; requires a separately built "
+     "Gemma index.\"},"
      "\"semantic_limit\":{\"type\":\"integer\",\"default\":50,\"minimum\":0,"
      "\"maximum\":500},"
      "\"semantic_offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,"
@@ -1881,6 +1885,7 @@ struct cbm_mcp_server {
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
     cbm_mcp_tool_profile_t tool_profile;
     cbm_architecture_jobs_t *architecture_jobs;
+    cbm_gemma2_worker_t *gemma2_worker; /* model lifetime follows this server */
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -2072,6 +2077,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
         return;
     }
     cbm_architecture_jobs_free(srv->architecture_jobs);
+    cbm_gemma2_free(srv->gemma2_worker);
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
     }
@@ -4510,16 +4516,42 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
 typedef enum {
     SQ_RUN_OK = 0,
-    SQ_RUN_TYPE_ERROR,  /* semantic_query is not an array of strings */
-    SQ_RUN_STORE_ERROR, /* the vector scan itself failed */
+    SQ_RUN_TYPE_ERROR,    /* semantic_query is not an array of strings */
+    SQ_RUN_STORE_ERROR,   /* the vector scan itself failed */
+    SQ_RUN_BACKEND_ERROR, /* the explicitly selected local worker failed */
 } sq_run_status_t;
 
 /* Run the semantic_query vector search from raw args. Sets *out_vresults /
  * *out_vcount (caller frees via cbm_store_free_vector_results when vcount>0).
  * A store without a vector table (lean index) is an empty result; a failed
  * scan is SQ_RUN_STORE_ERROR and must never be rendered as zero matches. */
-static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *store,
-                                               const char *project, int materialize_limit,
+static char *semantic_query_error(sq_run_status_t sq_status) {
+    if (sq_status == SQ_RUN_BACKEND_ERROR) {
+        return cbm_mcp_text_result(
+            "EmbeddingGemma 2 search failed. Configure CBM_GEMMA2_PYTHON and "
+            "CBM_GEMMA2_SCRIPT, create its initial index, and inspect the worker log. "
+            "After source changes, wait for the native watcher or reindex CBM; "
+            "Gemma refreshes its existing index on the next search. "
+            "The selected backend was not replaced by the default model.",
+            true);
+    }
+    if (sq_status == SQ_RUN_STORE_ERROR) {
+        return cbm_mcp_text_result(
+            "semantic search failed: the vector index could not be scanned — see the "
+            "server log for the SQLite error; reindex the project if it persists.",
+            true);
+    }
+    return cbm_mcp_text_result(
+        "semantic_query must be an array of keyword strings, e.g. "
+        "[\"send\",\"pubsub\",\"publish\"] — not a single string, and every element "
+        "must be a string. Split your query into individual keywords; each is scored "
+        "independently via per-keyword min-cosine.",
+        true);
+}
+
+static sq_run_status_t run_semantic_query_core(cbm_mcp_server_t *srv, const char *args,
+                                               cbm_store_t *store, const char *project,
+                                               int materialize_limit,
                                                cbm_vector_result_t **out_vresults, int *out_vcount,
                                                bool *out_present) {
     enum { MAX_KW_SEARCH = 32 };
@@ -4542,19 +4574,24 @@ static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *st
         int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
         if (ki < 0) {
             status = SQ_RUN_TYPE_ERROR;
-        } else {
-            cbm_vector_result_t *vresults = NULL;
-            int vcount = 0;
-            int rc = cbm_store_vector_search(store, project, keywords, ki, materialize_limit,
-                                             &vresults, &vcount);
-            if (rc == CBM_STORE_ERR) {
-                status = SQ_RUN_STORE_ERROR;
-            } else if (rc == CBM_STORE_OK && vcount > 0) {
-                *out_vresults = vresults;
-                *out_vcount = vcount;
-            }
+            goto cleanup;
+        }
+        cbm_vector_result_t *vresults = NULL;
+        int vcount = 0;
+        const char *model = yyjson_get_str(yyjson_obj_get(args_root, "embedding_model"));
+        bool gemma = model && strcmp(model, "embeddinggemma-2") == 0;
+        int rc = gemma ? cbm_gemma2_search(&srv->gemma2_worker, store, project, keywords, ki,
+                                           materialize_limit, &vresults, &vcount)
+                       : cbm_store_vector_search(store, project, keywords, ki, materialize_limit,
+                                                 &vresults, &vcount);
+        if (rc == CBM_STORE_ERR) {
+            status = gemma ? SQ_RUN_BACKEND_ERROR : SQ_RUN_STORE_ERROR;
+        } else if (rc == CBM_STORE_OK && vcount > 0) {
+            *out_vresults = vresults;
+            *out_vcount = vcount;
         }
     }
+cleanup:
     if (args_doc) {
         yyjson_doc_free(args_doc);
     }
@@ -4569,6 +4606,18 @@ static bool search_graph_arg_present(const char *args, const char *name) {
         yyjson_doc_free(doc);
     }
     return present;
+}
+
+static bool search_graph_model_valid(const char *args) {
+    if (!search_graph_arg_present(args, "embedding_model")) {
+        return true;
+    }
+    char *model = cbm_mcp_get_string_arg(args, "embedding_model");
+    bool valid = model &&
+                 (strcmp(model, "default") == 0 || strcmp(model, "embeddinggemma-2") == 0) &&
+                 search_graph_arg_present(args, "semantic_query");
+    free(model);
+    return valid;
 }
 
 /* ── Tree output for search_graph ───────────────────────────────────
@@ -5307,6 +5356,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
+    if (!search_graph_model_valid(args)) {
+        free(project);
+        return cbm_mcp_text_result(
+            "embedding_model must be default or embeddinggemma-2 and requires semantic_query.",
+            true);
+    }
+
     /* Response encoding: the default tree chooses direct/grouped by serialized
      * size; format:"json" keeps the stable grouped model. The token argument
      * becomes a deterministic byte ceiling: tokenizers differ, bytes do not. */
@@ -5439,7 +5495,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     int vcount = 0;
     bool sq_present = false;
     sq_run_status_t sq_status = run_semantic_query_core(
-        args, store, project, semantic_materialize_limit, &vresults, &vcount, &sq_present);
+        srv, args, store, project, semantic_materialize_limit, &vresults, &vcount, &sq_present);
     if (sq_status != SQ_RUN_OK) {
         if (fields_owner) {
             yyjson_doc_free(fields_owner);
@@ -5450,18 +5506,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(qn_pattern);
         free(file_pattern);
         free(relationship);
-        if (sq_status == SQ_RUN_STORE_ERROR) {
-            return cbm_mcp_text_result(
-                "semantic search failed: the vector index could not be scanned — see the "
-                "server log for the SQLite error; reindex the project if it persists.",
-                true);
-        }
-        return cbm_mcp_text_result(
-            "semantic_query must be an array of keyword strings, e.g. "
-            "[\"send\",\"pubsub\",\"publish\"] — not a single string, and every element "
-            "must be a string. Split your query into individual keywords; each is scored "
-            "independently via per-keyword min-cosine.",
-            true);
+        return semantic_query_error(sq_status);
     }
 
     int semantic_available = vcount > semantic_offset ? vcount - semantic_offset : 0;
@@ -20248,6 +20293,31 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
     return true;
 }
 
+static bool gemma2_preload_if_requested(cbm_mcp_server_t *srv) {
+    char preload[CBM_SZ_16];
+    if (!cbm_safe_getenv("CBM_GEMMA2_PRELOAD", preload, sizeof(preload), "0")) {
+        return false;
+    }
+    if (!preload[0] || strcmp(preload, "0") == 0) {
+        return true;
+    }
+    return strcmp(preload, "1") == 0 && cbm_gemma2_preload(&srv->gemma2_worker) == CBM_STORE_OK;
+}
+
+static char *mcp_initialize_session(cbm_mcp_server_t *srv, const char *params, char **error) {
+    if (!gemma2_preload_if_requested(srv)) {
+        *error = heap_strdup("{\"code\":-32603,\"message\":\"EmbeddingGemma 2 preload failed; "
+                             "check CBM_GEMMA2_PRELOAD (0 or 1), worker configuration and log\"}");
+        return NULL;
+    }
+    char *result = cbm_mcp_initialize_response_for_profile(params, srv->tool_profile);
+    detect_session(srv);
+    if (srv->background_tasks && srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
+        maybe_auto_index(srv);
+    }
+    return result;
+}
+
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_jsonrpc_request_t req = {0};
     if (cbm_jsonrpc_parse(line, &req) < 0) {
@@ -20281,11 +20351,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
-        result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
-        detect_session(srv);
-        if (srv->background_tasks && srv->tool_profile == CBM_MCP_TOOL_PROFILE_ALL) {
-            maybe_auto_index(srv);
-        }
+        result_json = mcp_initialize_session(srv, req.params_raw, &request_error_json);
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "resources/list") == 0) {

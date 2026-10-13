@@ -49,6 +49,12 @@ typedef enum {
 /* Create a new pipeline. Caller owns the result. */
 cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm_index_mode_t mode);
 
+/* Reuse native discovery and exact hashes to verify a complete published index.
+ * False includes stale inputs, incomplete metadata and inspection errors.
+ * Does not parse code or write either index. */
+bool cbm_pipeline_inputs_match_store(cbm_store_t *store, const char *project,
+                                     const cbm_index_resource_policy_t *policy);
+
 /* Enable persistent artifact export (.codebase-memory/graph.db.zst).
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);

@@ -24389,7 +24389,74 @@ TEST(search_code_drops_walker_hits_that_resolve_outside_root) {
 #endif
 }
 
+TEST(tool_search_graph_optional_embedding_model_validation) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    cbm_mcp_server_set_project(srv, "gemma-option");
+    cbm_store_upsert_project(store, "gemma-option", "/tmp/gemma-option");
+    cbm_node_t node = {.project = "gemma-option",
+                       .label = "Function",
+                       .name = "alpha",
+                       .qualified_name = "gemma-option.alpha",
+                       .file_path = "sample.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    const char *arguments[] = {
+        "{\"project\":\"gemma-option\",\"embedding_model\":\"unknown\",\"semantic_query\":["
+        "\"alpha\"]}",
+        "{\"project\":\"gemma-option\",\"embedding_model\":true,\"semantic_query\":[\"alpha\"]}",
+        "{\"project\":\"gemma-option\",\"embedding_model\":\"embeddinggemma-2\",\"query\":"
+        "\"alpha\"}",
+        "{\"project\":\"gemma-option\",\"embedding_model\":\"embeddinggemma-2\",\"semantic_query\":"
+        "[\"alpha\"]}"};
+    for (size_t i = 0; i < sizeof(arguments) / sizeof(arguments[0]); i++) {
+        char *response = cbm_mcp_handle_tool(srv, "search_graph", arguments[i]);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        ASSERT_NOT_NULL(
+            strstr(response, i < 3 ? "embedding_model" : "EmbeddingGemma 2 search failed"));
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(mcp_initialize_optional_gemma_preload_failures) {
+    mcp_test_env_backup_t backups[] = {{.name = "CBM_GEMMA2_PRELOAD"},
+                                       {.name = "CBM_GEMMA2_PYTHON"}};
+    for (size_t i = 0; i < sizeof(backups) / sizeof(backups[0]); i++) {
+        char value[CBM_SZ_4K];
+        const char *saved = cbm_safe_getenv(backups[i].name, value, sizeof(value), NULL);
+        backups[i].present = saved != NULL;
+        backups[i].value = saved ? strdup(saved) : NULL;
+    }
+    cbm_setenv("CBM_GEMMA2_PYTHON", "", 1);
+    const char *options[] = {"1", "true", "123456789012345678901234567890", "0"};
+    bool matches = true;
+    for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); i++) {
+        cbm_setenv("CBM_GEMMA2_PRELOAD", options[i], 1);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        cbm_mcp_server_set_background_tasks(srv, false);
+        char *response = srv ? cbm_mcp_server_handle(
+                                   srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                                        "\"params\":{\"protocolVersion\":\"2025-06-18\"}}")
+                             : NULL;
+        bool error = response && strstr(response, "EmbeddingGemma 2 preload failed");
+        matches = matches && response && (error == (i < 3));
+        free(response);
+        cbm_mcp_server_free(srv);
+    }
+    mcp_test_restore_env(backups, sizeof(backups) / sizeof(backups[0]));
+    ASSERT_TRUE(matches);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(mcp_initialize_optional_gemma_preload_failures);
+    RUN_TEST(tool_search_graph_optional_embedding_model_validation);
+
     RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
     RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
     RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
