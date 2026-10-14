@@ -5,10 +5,13 @@
  * proximity, diffuse, corpus lifecycle, get_config.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
+#include <pipeline/pipeline.h>
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_thread.h"
 #include <semantic/rotsq.h>
 #include <semantic/semantic.h>
+#include <semantic/embedding_backend.h>
 
 #include <math.h>
 #include <stdatomic.h>
@@ -883,7 +886,155 @@ TEST(sem_rotsq_ip_error_bounds) {
 
 /* ── Suite ───────────────────────────────────────────────────────── */
 
+static cbm_store_t *gemma_test_store(int64_t *first, int64_t *second) {
+    cbm_store_t *store = cbm_store_open_memory();
+    if (!store)
+        return NULL;
+    cbm_store_upsert_project(store, "gemma-test", "/tmp/gemma-test");
+    cbm_node_t node = {.project = "gemma-test",
+                       .label = "Function",
+                       .name = "alpha",
+                       .qualified_name = "gemma-test.alpha",
+                       .file_path = "sample.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    *first = cbm_store_upsert_node(store, &node);
+    node.name = "beta";
+    node.qualified_name = "gemma-test.beta";
+    *second = cbm_store_upsert_node(store, &node);
+    return store;
+}
+
+TEST(gemma2_response_matches_active_store) {
+    int64_t first, second;
+    cbm_store_t *store = gemma_test_store(&first, &second);
+    ASSERT_NOT_NULL(store);
+    char generation[64], reply[1024];
+    ASSERT_EQ(cbm_store_generation(store, generation, sizeof(generation)), CBM_STORE_OK);
+    snprintf(reply, sizeof(reply),
+             "{\"profile\":\"%s\",\"generation\":\"%s\",\"results\":["
+             "{\"node_id\":%lld,\"score\":0.9},{\"node_id\":%lld,\"score\":0.8}]}",
+             CBM_GEMMA2_PROFILE_ID, generation, (long long)first, (long long)second);
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gemma2_decode(store, "gemma-test", generation, reply, strlen(reply), 2, &results,
+                                &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(results[0].name, "alpha");
+    ASSERT_STR_EQ(results[1].name, "beta");
+    cbm_store_free_vector_results(results, count);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(gemma2_response_rejects_invalid_rank_ids_and_scores) {
+    int64_t first, second;
+    cbm_store_t *store = gemma_test_store(&first, &second);
+    ASSERT_NOT_NULL(store);
+    char generation[64], rows[512], reply[1024];
+    ASSERT_EQ(cbm_store_generation(store, generation, sizeof(generation)), CBM_STORE_OK);
+    const char *bad_rows[] = {"[{\"node_id\":999999,\"score\":0.9}]",
+                              "[{\"node_id\":1,\"score\":2.0}]",
+                              "[{\"node_id\":1.5,\"score\":0.9}]",
+                              "[{\"node_id\":1,\"score\":\"NaN\"}]",
+                              "null",
+                              "[false]"};
+    for (size_t i = 0; i < sizeof(bad_rows) / sizeof(bad_rows[0]); i++) {
+        snprintf(reply, sizeof(reply), "{\"profile\":\"%s\",\"generation\":\"%s\",\"results\":%s}",
+                 CBM_GEMMA2_PROFILE_ID, generation, bad_rows[i]);
+        cbm_vector_result_t *results = NULL;
+        int count = 0;
+        ASSERT_EQ(cbm_gemma2_decode(store, "gemma-test", generation, reply, strlen(reply), 2,
+                                    &results, &count),
+                  CBM_STORE_ERR);
+        ASSERT_NULL(results);
+        ASSERT_EQ(count, 0);
+    }
+    for (int duplicate = 0; duplicate < 2; duplicate++) {
+        snprintf(rows, sizeof(rows),
+                 "[{\"node_id\":%lld,\"score\":0.8},"
+                 "{\"node_id\":%lld,\"score\":%s}]",
+                 (long long)first, (long long)(duplicate ? first : second),
+                 duplicate ? "0.7" : "0.9");
+        snprintf(reply, sizeof(reply), "{\"profile\":\"%s\",\"generation\":\"%s\",\"results\":%s}",
+                 CBM_GEMMA2_PROFILE_ID, generation, rows);
+        cbm_vector_result_t *results = NULL;
+        int count = 0;
+        ASSERT_EQ(cbm_gemma2_decode(store, "gemma-test", generation, reply, strlen(reply), 2,
+                                    &results, &count),
+                  CBM_STORE_ERR);
+    }
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(gemma2_response_rejects_profile_project_and_generation_mismatch) {
+    int64_t first, second;
+    cbm_store_t *store = gemma_test_store(&first, &second);
+    ASSERT_NOT_NULL(store);
+    char generation[64], reply[1024];
+    ASSERT_EQ(cbm_store_generation(store, generation, sizeof(generation)), CBM_STORE_OK);
+    snprintf(reply, sizeof(reply), "{\"profile\":\"%s\",\"generation\":\"%s\",\"results\":[]}",
+             "other-model", generation);
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gemma2_decode(store, "gemma-test", generation, reply, strlen(reply), 2, &results,
+                                &count),
+              CBM_STORE_ERR);
+    snprintf(reply, sizeof(reply),
+             "{\"profile\":\"%s\",\"generation\":\"%s\",\"results\":["
+             "{\"node_id\":%lld,\"score\":0.8}]}",
+             CBM_GEMMA2_PROFILE_ID, generation, (long long)first);
+    ASSERT_EQ(cbm_gemma2_decode(store, "other-project", generation, reply, strlen(reply), 2,
+                                &results, &count),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_upsert_project(store, "changed", "/tmp/changed"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_gemma2_decode(store, "gemma-test", generation, reply, strlen(reply), 2, &results,
+                                &count),
+              CBM_STORE_ERR);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(gemma2_native_manifest_rejects_added_deleted_and_changed_files) {
+    char *root = th_mktempdir("gemma2_fresh");
+    ASSERT_NOT_NULL(root);
+    char db_path[CBM_PATH_MAX], original_path[CBM_PATH_MAX], added_path[CBM_PATH_MAX];
+    snprintf(db_path, sizeof(db_path), "%s/native.db", root);
+    snprintf(original_path, sizeof(original_path), "%s/first.py", root);
+    snprintf(added_path, sizeof(added_path), "%s/added.py", root);
+    const char *original = "def alpha():\n    return 1\n";
+    ASSERT_EQ(th_write_file(original_path, original), 0);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_pipeline_set_doc_candidates_enabled(pipeline, false);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(pipeline, "gemma2-fresh"));
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(cbm_pipeline_inputs_match_store(store, "gemma2-fresh", NULL));
+    ASSERT_EQ(th_write_file(added_path, "def beta():\n    return 2\n"), 0);
+    ASSERT_FALSE(cbm_pipeline_inputs_match_store(store, "gemma2-fresh", NULL));
+    ASSERT_EQ(cbm_unlink(added_path), 0);
+    ASSERT_TRUE(cbm_pipeline_inputs_match_store(store, "gemma2-fresh", NULL));
+    ASSERT_EQ(th_write_file(original_path, "def alpha():\n    return 9\n"), 0);
+    ASSERT_FALSE(cbm_pipeline_inputs_match_store(store, "gemma2-fresh", NULL));
+    ASSERT_EQ(th_write_file(original_path, original), 0);
+    ASSERT_EQ(cbm_unlink(original_path), 0);
+    ASSERT_FALSE(cbm_pipeline_inputs_match_store(store, "gemma2-fresh", NULL));
+    cbm_store_close(store);
+    ASSERT_EQ(th_rmtree(root), 0);
+    PASS();
+}
+
 SUITE(semantic) {
+    RUN_TEST(gemma2_native_manifest_rejects_added_deleted_and_changed_files);
+    RUN_TEST(gemma2_response_matches_active_store);
+    RUN_TEST(gemma2_response_rejects_invalid_rank_ids_and_scores);
+    RUN_TEST(gemma2_response_rejects_profile_project_and_generation_mismatch);
+
     RUN_TEST(sem_rotsq_concurrent_first_encode);
     RUN_TEST(sem_rotsq_ip_error_bounds);
     RUN_TEST(sem_tokenize_camel);

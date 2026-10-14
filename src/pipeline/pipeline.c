@@ -4823,3 +4823,44 @@ cbm_pipeline_frozen_status_t cbm_pipeline_frozen_build(cbm_pipeline_frozen_t *ow
     owner->state = status == CBM_PIPELINE_FROZEN_OK ? FROZEN_CANDIDATE : FROZEN_FAILED;
     return status;
 }
+
+bool cbm_pipeline_inputs_match_store(cbm_store_t *store, const char *project,
+                                     const cbm_index_resource_policy_t *policy) {
+    cbm_project_t info = {0};
+    cbm_coverage_meta_t meta = {0};
+    cbm_file_hash_t *stored = NULL;
+    cbm_file_hash_t *fresh = NULL;
+    int stored_count = 0;
+    int fresh_count = 0;
+    cbm_pipeline_t *pipeline = NULL;
+    bool ok = store && project && cbm_store_get_project(store, project, &info) == CBM_STORE_OK &&
+              cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
+              meta.hash_records_complete && meta.index_mode;
+    cbm_index_mode_t mode = CBM_MODE_FULL;
+    if (ok && strcmp(meta.index_mode, "moderate") == 0) {
+        mode = CBM_MODE_MODERATE;
+    } else if (ok && strcmp(meta.index_mode, "fast") == 0) {
+        mode = CBM_MODE_FAST;
+    } else if (ok && strcmp(meta.index_mode, "full") != 0) {
+        ok = false;
+    }
+    if (ok) {
+        pipeline = cbm_pipeline_new(info.root_path, NULL, mode);
+        ok = pipeline &&
+             cbm_store_get_file_hashes(store, project, &stored, &stored_count) == CBM_STORE_OK;
+    }
+    if (ok) {
+        if (policy) {
+            cbm_pipeline_set_resource_policy(pipeline, policy);
+        }
+        ok = cbm_pipeline_build_fresh_semantic_manifest(pipeline, project, &fresh, &fresh_count) ==
+                 0 &&
+             cbm_pipeline_semantic_manifests_equal(stored, stored_count, fresh, fresh_count);
+    }
+    cbm_pipeline_free_semantic_manifest(fresh, fresh_count);
+    cbm_store_free_file_hashes(stored, stored_count);
+    cbm_pipeline_free(pipeline);
+    cbm_store_coverage_meta_clear(&meta);
+    cbm_project_free_fields(&info);
+    return ok;
+}
