@@ -226,6 +226,7 @@ The install script placed beside the binary is **reported, not deleted** — uni
 
 ### Search
 - **Semantic search** (the `semantic_query` parameter of `search_graph`, not a separate tool): vector search across the entire graph, powered by bundled Nomic `nomic-embed-code` embeddings (40K tokens, 768d int8) compiled into the binary — no API key, no Ollama, no Docker. 11-signal combined scoring (TF-IDF, RRI, API/Type/Decorator signatures, AST profiles, data flow, Halstead-lite, MinHash, module proximity, graph diffusion).
+- **Optional EmbeddingGemma 2 backend** (fork prototype): select `embedding_model: "embeddinggemma-2"` for source-body retrieval with a separately installed local worker and independent index. [Setup and limits](docs/embeddinggemma2.md).
 - **BM25 full-text search** via SQLite FTS5 with `cbm_camel_split` tokenizer (camelCase / snake_case aware)
 - **Structural search** (`search_graph`): regex name patterns, label filters, min/max degree, file scoping
 - **Code search** (`search_code`): graph-augmented grep over indexed files only
